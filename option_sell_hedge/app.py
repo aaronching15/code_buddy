@@ -19,7 +19,7 @@ import streamlit as st
 from plotly.subplots import make_subplots
 
 from bs_engine import bs_price_and_greeks, implied_vol
-from backtest_engine import run_backtest, batch_backtest
+from backtest_engine import run_backtest, batch_backtest, calc_max_lots, calc_margin_per_lot
 from data_loader import (
     UNDERLYING_MAP,
     build_template_df,
@@ -205,7 +205,7 @@ def page_backtest():
 
         # 回测参数
         with st.expander("回测参数", expanded=False):
-            bt_col1, bt_col2, bt_col3, bt_col4 = st.columns(4)
+            bt_col1, bt_col2, bt_col3 = st.columns(3)
             initial_capital = bt_col1.number_input(
                 "期初本金（元）", value=1_000_000, step=100_000,
                 min_value=10_000, key="bt_capital",
@@ -215,33 +215,41 @@ def page_backtest():
                 key="bt_margin_ratio",
                 help="每手期权保证金 = 标的价 × 合约乘数 × 比例",
             )
-            delta_hedge = bt_col3.checkbox("启用 Delta 对冲（每日买卖ETF）", value=True,
+            max_margin_cap_pct = bt_col3.slider(
+                "保证金上限（净资产 %）", 50, 100, 80, 5,
+                key="bt_max_margin_cap",
+                help="总保证金占用不超过净资产的此比例（默认80%）",
+            )
+            bt_col4, bt_col5 = st.columns(2)
+            delta_hedge = bt_col4.checkbox("启用 Delta 对冲（每日买卖ETF）", value=True,
                                            key="bt_delta_hedge")
-            hedge_threshold = bt_col4.slider(
-                "对冲触发阈值（Delta）", 0.01, 0.20, 0.05, 0.01,
+            hedge_threshold = bt_col5.slider(
+                "对冲触发阈值（Delta）", 0.01, 0.30, 0.07, 0.01,
                 key="bt_hedge_thresh",
+                help="净Delta绝对值超过阈值时才执行ETF对冲（默认0.07）",
             )
 
         # 资金占用预估（实时显示，不需要点按钮）
         if pairs:
-            from backtest_engine import calc_max_lots, calc_margin_per_lot
             sample_pair  = pairs[0]
             sample_mult  = int(sample_pair["call_leg"].get("multiplier", 10000))
-            margin_ratio = margin_ratio_pct / 100.0
+            margin_ratio    = margin_ratio_pct / 100.0
+            max_margin_cap  = max_margin_cap_pct / 100.0
             m_per_lot    = calc_margin_per_lot(spot, sample_mult, margin_ratio)
             qty_est      = calc_max_lots(
-                float(initial_capital), spot, sample_mult, margin_ratio, n_legs=2)
+                float(initial_capital), spot, sample_mult, margin_ratio,
+                n_legs=2, max_margin_cap=max_margin_cap)
             total_margin_est = 2 * m_per_lot * qty_est
             margin_pct_est   = total_margin_est / float(initial_capital) * 100
             free_cap_est     = float(initial_capital) - total_margin_est
 
             st.info(
                 "💡 **资金占用预估**：标的价 {:.3f}，1手保证金 **{:,.0f} 元**（名义本金{:,.0f}×{:.0f}%）；"
-                "本金 {:,.0f} 元 → 每腿最多建仓 **{} 手**（共 {} 手 call + {} 手 put），"
+                "本金 {:,.0f} 元（上限{:.0f}%）→ 每腿最多建仓 **{} 手**（共 {} 手 call + {} 手 put），"
                 "保证金占用 **{:,.0f} 元（{:.1f}%）**，可用资金 **{:,.0f} 元**".format(
                     spot,
                     m_per_lot, spot * sample_mult, margin_ratio_pct,
-                    float(initial_capital),
+                    float(initial_capital), max_margin_cap_pct,
                     qty_est, qty_est, qty_est,
                     total_margin_est, margin_pct_est, free_cap_est,
                 )
@@ -250,7 +258,8 @@ def page_backtest():
         if st.button("运行回测", type="primary"):
             all_results = []
             debug_msgs  = []
-            margin_ratio = margin_ratio_pct / 100.0
+            margin_ratio   = margin_ratio_pct / 100.0
+            max_margin_cap = max_margin_cap_pct / 100.0
             for pair in pairs:
                 positions = strangle_to_positions(pair)
                 # 调试：打印各腿 open_price
@@ -267,6 +276,7 @@ def page_backtest():
                     hedge_threshold=hedge_threshold,
                     initial_capital=float(initial_capital),
                     margin_ratio=margin_ratio,
+                    max_margin_cap=max_margin_cap,
                 )
                 summary = summarize_strangle(pair, spot)
                 label = "Call{}/Put{}".format(
@@ -313,14 +323,20 @@ def page_backtest():
         trade_log = res.get("trade_log", [])
 
         # ── 概览：本金 + 权利金 + 最终盈亏 ─────────────────────────────────
-        cap_col1, cap_col2, cap_col3, cap_col4 = st.columns(4)
+        cap_col1, cap_col2, cap_col3 = st.columns(3)
         cap_col1.info("💰 期初本金：**{:,.0f} 元**".format(
             stats.get("initial_capital", 0)))
         cap_col2.info("📥 收取权利金：**{:,.2f} 元**".format(
             stats.get("total_premium", 0)))
-        cap_col3.info("📤 最终盈亏：**{:+,.2f} 元**".format(
+        cap_col3.info("📤 最终盈亏：**{:+,.2f} 元**（总计）".format(
             stats.get("final_pnl", 0)))
-        cap_col4.info("📊 浮盈亏（期末）：**{:+,.2f} 元** / **{:+.2f}%**（权利金）/ **{:+.2f}%**（本金）".format(
+
+        cap_col4, cap_col5, cap_col6 = st.columns(3)
+        cap_col4.info("📈 期权累计盈亏：**{:+,.2f} 元**".format(
+            stats.get("final_opt_pnl", 0)))
+        cap_col5.info("🔄 ETF对冲盈亏：**{:+,.2f} 元**".format(
+            stats.get("final_etf_pnl", 0)))
+        cap_col6.info("📊 浮盈亏（期末）：**{:+,.2f} 元** / **{:+.2f}%**（权利金）/ **{:+.2f}%**（本金）".format(
             stats.get("final_float_pnl", 0),
             stats.get("final_float_pct_prem", 0),
             stats.get("final_float_pct_cap", 0),
@@ -328,12 +344,14 @@ def page_backtest():
 
         # ── 资金占用面板 ─────────────────────────────────────────────────────
         with st.expander("💼 资金占用详情", expanded=False):
-            mc_a, mc_b, mc_c, mc_d, mc_e = st.columns(5)
+            mc_a, mc_b, mc_c, mc_d, mc_e, mc_f = st.columns(6)
             mc_a.metric("每手保证金", "{:,.0f} 元".format(stats.get("margin_per_lot", 0)))
             mc_b.metric("每腿建仓手数", "{} 手".format(stats.get("qty_per_leg", 1)))
             mc_c.metric("保证金总占用", "{:,.0f} 元".format(stats.get("total_margin", 0)))
             mc_d.metric("保证金占本金", "{:.1f}%".format(stats.get("margin_pct", 0)))
-            mc_e.metric("可用余资金", "{:,.0f} 元".format(stats.get("free_capital", 0)))
+            mc_e.metric("保证金上限", "{:.0f}%净资产".format(
+                stats.get("max_margin_cap", 0.80) * 100))
+            mc_f.metric("可用余资金", "{:,.0f} 元".format(stats.get("free_capital", 0)))
 
         # 绩效指标卡片
         mc1, mc2, mc3, mc4, mc5 = st.columns(5)
@@ -383,14 +401,19 @@ def page_backtest():
                 st.info("暂无交易记录")
 
         # ── 三图：价格路径 + 累计盈亏 + Delta 走势 ───────────────────────
-        has_delta    = "net_delta"   in df_daily.columns
-        has_float    = "float_pnl"  in df_daily.columns
-        n_rows       = 3 if has_delta else 2
-        row_h        = [0.40, 0.38, 0.22] if has_delta else [0.52, 0.48]
-        subtitles    = (
-            ["标的价格路径 + 行权价区间", "逐日累计盈亏（期权+ETF对冲）", "净Delta走势"]
+        has_delta        = "net_delta"          in df_daily.columns
+        has_float        = "float_pnl"          in df_daily.columns
+        has_cum_opt      = "cumulative_opt_pnl" in df_daily.columns
+        has_cum_etf      = "cumulative_etf_pnl" in df_daily.columns
+        n_rows           = 3 if has_delta else 2
+        row_h            = [0.38, 0.38, 0.24] if has_delta else [0.52, 0.48]
+        subtitles        = (
+            ["标的价格路径 + 行权价区间",
+             "累计盈亏：总 / 期权 / ETF对冲",
+             "净Delta走势（对冲触发阈值 {:.2f}）".format(hedge_threshold)]
             if has_delta else
-            ["标的价格路径 + 行权价区间", "逐日累计盈亏"]
+            ["标的价格路径 + 行权价区间",
+             "累计盈亏：总 / 期权 / ETF对冲"]
         )
 
         fig = make_subplots(
@@ -426,6 +449,7 @@ def page_backtest():
                           annotation_text=lbl, row=1, col=1)
 
         # 图2：累计盈亏（总 + 期权分量 + ETF分量）
+        # ── 主曲线：累计总盈亏（含填充）
         pnl_color = "#00cc44" if df_daily["cumulative_pnl"].iloc[-1] >= 0 else "#ff4444"
         fig.add_trace(
             go.Scatter(
@@ -433,62 +457,102 @@ def page_backtest():
                 y=df_daily["cumulative_pnl"],
                 mode="lines", fill="tozeroy",
                 name="累计总盈亏",
-                line={"color": pnl_color, "width": 2},
-                fillcolor="rgba(0,204,68,0.15)" if pnl_color == "#00cc44"
-                           else "rgba(255,68,68,0.15)",
+                line={"color": pnl_color, "width": 2.5},
+                fillcolor="rgba(0,204,68,0.12)" if pnl_color == "#00cc44"
+                           else "rgba(255,68,68,0.12)",
             ), row=2, col=1,
         )
-        if "opt_pnl" in df_daily.columns:
+        # ── 期权累计盈亏
+        if has_cum_opt:
+            fig.add_trace(
+                go.Scatter(
+                    x=df_daily["date"].astype(str),
+                    y=df_daily["cumulative_opt_pnl"],
+                    mode="lines", name="期权累计盈亏",
+                    line={"color": "#17becf", "width": 1.8, "dash": "dot"},
+                ), row=2, col=1,
+            )
+        elif "opt_pnl" in df_daily.columns:
             fig.add_trace(
                 go.Scatter(
                     x=df_daily["date"].astype(str),
                     y=df_daily["opt_pnl"].cumsum(),
-                    mode="lines", name="期权盈亏",
-                    line={"color": "#17becf", "width": 1.5, "dash": "dot"},
+                    mode="lines", name="期权累计盈亏",
+                    line={"color": "#17becf", "width": 1.8, "dash": "dot"},
                 ), row=2, col=1,
             )
-        if "etf_pnl" in df_daily.columns:
+        # ── ETF累计盈亏
+        if has_cum_etf:
+            fig.add_trace(
+                go.Scatter(
+                    x=df_daily["date"].astype(str),
+                    y=df_daily["cumulative_etf_pnl"],
+                    mode="lines", name="ETF对冲累计盈亏",
+                    line={"color": "#bcbd22", "width": 1.8, "dash": "dash"},
+                ), row=2, col=1,
+            )
+        elif "etf_pnl" in df_daily.columns:
             fig.add_trace(
                 go.Scatter(
                     x=df_daily["date"].astype(str),
                     y=df_daily["etf_pnl"].cumsum(),
-                    mode="lines", name="ETF对冲盈亏",
-                    line={"color": "#bcbd22", "width": 1.5, "dash": "dot"},
+                    mode="lines", name="ETF对冲累计盈亏",
+                    line={"color": "#bcbd22", "width": 1.8, "dash": "dash"},
                 ), row=2, col=1,
             )
+        # ── 浮盈亏曲线（权利金衰减）
         if has_float:
             fig.add_trace(
                 go.Scatter(
                     x=df_daily["date"].astype(str),
                     y=df_daily["float_pnl"],
-                    mode="lines", name="浮盈亏（期权仓位）",
-                    line={"color": "#e377c2", "width": 1.5, "dash": "dash"},
+                    mode="lines", name="浮盈亏（权利金衰减）",
+                    line={"color": "#e377c2", "width": 1.2, "dash": "longdash"},
+                    opacity=0.75,
                 ), row=2, col=1,
             )
 
-        # 图3：净 Delta
+        # 零线
+        fig.add_hline(y=0, line_color="#555555", line_dash="solid",
+                      line_width=1, row=2, col=1)
+
+        # 图3：净 Delta（Bar，超阈值变色）
         if has_delta:
+            bar_colors = []
+            for v in df_daily["net_delta"]:
+                if abs(v) > hedge_threshold:
+                    bar_colors.append("#ff4444" if v > 0 else "#4488ff")
+                else:
+                    bar_colors.append("#ff7f0e" if v > 0 else "#1f77b4")
             fig.add_trace(
                 go.Bar(
                     x=df_daily["date"].astype(str),
                     y=df_daily["net_delta"],
                     name="净Delta",
-                    marker_color=[
-                        "#ff7f0e" if v > 0 else "#1f77b4"
-                        for v in df_daily["net_delta"]
-                    ],
+                    marker_color=bar_colors,
+                    opacity=0.85,
                 ), row=3, col=1,
             )
+            # 对冲阈值线
             fig.add_hline(y=0, line_color="#888888", row=3, col=1)
+            fig.add_hline(y=hedge_threshold,  line_color="#ff4444",
+                          line_dash="dot", line_width=1,
+                          annotation_text="+{:.2f}阈值".format(hedge_threshold),
+                          row=3, col=1)
+            fig.add_hline(y=-hedge_threshold, line_color="#4488ff",
+                          line_dash="dot", line_width=1,
+                          annotation_text="-{:.2f}阈值".format(hedge_threshold),
+                          row=3, col=1)
 
         fig.update_layout(
-            height=700 if has_delta else 600,
+            height=750 if has_delta else 600,
             paper_bgcolor="#0e1117",
             plot_bgcolor="#1a1d23",
             font={"color": "#fafafa", "size": 12},
             showlegend=True,
-            legend={"bgcolor": "#1a1d23"},
-            margin={"t": 60, "b": 40},
+            legend={"bgcolor": "#1a1d23", "orientation": "h",
+                    "x": 0, "y": -0.05},
+            margin={"t": 60, "b": 60},
         )
         fig.update_xaxes(gridcolor="#2a2d33")
         fig.update_yaxes(gridcolor="#2a2d33")
@@ -497,18 +561,27 @@ def page_backtest():
 
         # ── 逐日明细表（可折叠） ──────────────────────────────────────────
         with st.expander("📊 逐日回测明细", expanded=False):
-            daily_show = ["date", "spot"]
-            daily_show += [c for c in df_daily.columns if c.startswith("pos_")]
+            daily_show = ["date", "spot", "sigma"]
             daily_show += [c for c in df_daily.columns if c.startswith("mkt_")]
-            daily_show += ["opt_pnl", "etf_pnl", "total_pnl", "cumulative_pnl",
-                           "float_pnl", "float_pnl_pct", "float_pnl_cap_pct",
-                           "net_delta", "etf_shares", "opt_mkt_val"]
+            daily_show += [c for c in df_daily.columns if c.startswith("pos_")]
+            daily_show += [
+                "opt_pnl", "etf_pnl", "total_pnl",
+                "cumulative_opt_pnl", "cumulative_etf_pnl", "cumulative_pnl",
+                "float_pnl", "float_pnl_pct", "float_pnl_cap_pct",
+                "opt_mkt_val", "net_delta", "etf_shares",
+            ]
             daily_show = [c for c in daily_show if c in df_daily.columns]
-            fmt_dict   = {c: "{:.4f}" for c in daily_show if c != "date"}
-            # 浮盈亏百分比列用百分号格式
+            fmt_dict   = {c: "{:.4f}" for c in daily_show if c not in ("date",)}
+            # 百分比列
             for pct_col in ["float_pnl_pct", "float_pnl_cap_pct"]:
                 if pct_col in fmt_dict:
                     fmt_dict[pct_col] = "{:.2f}%"
+            # 金额类列保留 2 位小数
+            for amt_col in ["opt_pnl", "etf_pnl", "total_pnl",
+                            "cumulative_opt_pnl", "cumulative_etf_pnl",
+                            "cumulative_pnl", "float_pnl", "opt_mkt_val"]:
+                if amt_col in fmt_dict:
+                    fmt_dict[amt_col] = "{:.2f}"
             st.dataframe(
                 df_daily[daily_show].style.format(fmt_dict),
                 width='stretch',
