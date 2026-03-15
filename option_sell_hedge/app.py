@@ -7,6 +7,7 @@ Strangle 卖出对冲策略研究与监控系统 - Streamlit 主入口
 """
 
 import datetime
+import math
 import os
 import time
 from typing import Dict, List, Optional
@@ -234,11 +235,21 @@ def page_backtest():
 
         # 绩效指标卡片
         mc1, mc2, mc3, mc4, mc5 = st.columns(5)
-        mc1.metric("总收益率",    "{:+.2f}%".format(stats.get("total_return_pct", 0)))
-        mc2.metric("年化收益",    "{:+.2f}%".format(stats.get("annualized_pct", 0)))
-        mc3.metric("最大回撤",    "{:.2f}%".format(stats.get("max_drawdown_pct", 0)))
-        mc4.metric("Sharpe",      "{:.3f}".format(stats.get("sharpe", 0)))
-        mc5.metric("胜率（日）",  "{:.1f}%".format(stats.get("win_rate_pct", 0)))
+        def _fmt_pct(val, plus=False):
+            """安全格式化百分比，NaN/None 显示 N/A"""
+            try:
+                v = float(val)
+                if not math.isfinite(v):
+                    return "N/A"
+                return ("{:+.2f}%" if plus else "{:.2f}%").format(v)
+            except Exception:
+                return "N/A"
+
+        mc1.metric("总收益率",    _fmt_pct(stats.get("total_return_pct", 0), plus=True))
+        mc2.metric("年化收益",    _fmt_pct(stats.get("annualized_pct",   0), plus=True))
+        mc3.metric("最大回撤",    _fmt_pct(stats.get("max_drawdown_pct", 0)))
+        mc4.metric("Sharpe",      "{:.3f}".format(stats.get("sharpe", 0) or 0))
+        mc5.metric("胜率（日）",  "{:.1f}%".format(stats.get("win_rate_pct", 0) or 0))
 
         if df_daily.empty or df_price is None:
             continue
