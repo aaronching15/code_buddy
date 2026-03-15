@@ -200,22 +200,55 @@ def page_backtest():
             st.info("请在「数据导入」页面上传标的价格路径，然后点击运行回测。")
             return
 
+        # 回测参数
+        with st.expander("回测参数", expanded=False):
+            bt_col1, bt_col2, bt_col3 = st.columns(3)
+            initial_capital = bt_col1.number_input(
+                "期初本金（元）", value=1_000_000, step=100_000,
+                min_value=10_000, key="bt_capital",
+            )
+            delta_hedge = bt_col2.checkbox("启用 Delta 对冲（每日买卖ETF）", value=True,
+                                           key="bt_delta_hedge")
+            hedge_threshold = bt_col3.slider(
+                "对冲触发阈值（Delta）", 0.01, 0.20, 0.05, 0.01,
+                key="bt_hedge_thresh",
+            )
+
         if st.button("运行回测", type="primary"):
             all_results = []
+            debug_msgs  = []
             for pair in pairs:
                 positions = strangle_to_positions(pair)
-                df_daily, stats = run_backtest(positions, df_price, r=r)
+                # 调试：打印各腿 open_price
+                for p in positions:
+                    debug_msgs.append(
+                        "{} K={} open_price={:.4f} iv={:.2%}".format(
+                            p["call_put"], p["strike_price"],
+                            p["open_price"], p.get("iv", 0)
+                        )
+                    )
+                df_daily, stats, trade_log = run_backtest(
+                    positions, df_price, r=r,
+                    delta_hedge=delta_hedge,
+                    hedge_threshold=hedge_threshold,
+                    initial_capital=float(initial_capital),
+                )
                 summary = summarize_strangle(pair, spot)
                 label = "Call{}/Put{}".format(
                     summary["call_strike"], summary["put_strike"])
                 all_results.append({
-                    "label":    label,
-                    "df_daily": df_daily,
-                    "stats":    stats,
-                    "summary":  summary,
+                    "label":     label,
+                    "df_daily":  df_daily,
+                    "stats":     stats,
+                    "summary":   summary,
                     "positions": positions,
+                    "trade_log": trade_log,
                 })
             st.session_state["backtest_result"] = all_results
+            # 显示调试信息
+            with st.expander("调试：各腿开仓价格", expanded=False):
+                for msg in debug_msgs:
+                    st.text(msg)
 
     # ── 回测结果可视化 ─────────────────────────────────────────────────────────
     results = st.session_state.get("backtest_result")
@@ -227,42 +260,97 @@ def page_backtest():
 
     df_price = st.session_state.get("price_path_df")
 
+    def _fmt_pct(val, plus=False):
+        """安全格式化百分比，NaN/None 显示 N/A"""
+        try:
+            v = float(val)
+            if not math.isfinite(v):
+                return "N/A"
+            return ("{:+.2f}%" if plus else "{:.2f}%").format(v)
+        except Exception:
+            return "N/A"
+
     for res in results:
         st.markdown("#### {}".format(res["label"]))
-        summary  = res["summary"]
-        stats    = res["stats"]
-        df_daily = res["df_daily"]
+        summary   = res["summary"]
+        stats     = res["stats"]
+        df_daily  = res["df_daily"]
+        trade_log = res.get("trade_log", [])
+
+        # ── 概览：本金 + 权利金 + 最终盈亏 ─────────────────────────────────
+        cap_col1, cap_col2, cap_col3 = st.columns(3)
+        cap_col1.info("💰 期初本金：**{:,.0f} 元**".format(
+            stats.get("initial_capital", 0)))
+        cap_col2.info("📥 收取权利金：**{:,.2f} 元**".format(
+            stats.get("total_premium", 0)))
+        cap_col3.info("📤 最终盈亏：**{:+,.2f} 元**".format(
+            stats.get("final_pnl", 0)))
 
         # 绩效指标卡片
         mc1, mc2, mc3, mc4, mc5 = st.columns(5)
-        def _fmt_pct(val, plus=False):
-            """安全格式化百分比，NaN/None 显示 N/A"""
-            try:
-                v = float(val)
-                if not math.isfinite(v):
-                    return "N/A"
-                return ("{:+.2f}%" if plus else "{:.2f}%").format(v)
-            except Exception:
-                return "N/A"
+        mc1.metric("总收益率",   _fmt_pct(stats.get("total_return_pct", 0), plus=True))
+        mc2.metric("年化收益",   _fmt_pct(stats.get("annualized_pct",   0), plus=True))
+        mc3.metric("最大回撤",   _fmt_pct(stats.get("max_drawdown_pct", 0)))
+        mc4.metric("Sharpe",     "{:.3f}".format(stats.get("sharpe", 0) or 0))
+        mc5.metric("胜率（日）", "{:.1f}%".format(stats.get("win_rate_pct", 0) or 0))
 
-        mc1.metric("总收益率",    _fmt_pct(stats.get("total_return_pct", 0), plus=True))
-        mc2.metric("年化收益",    _fmt_pct(stats.get("annualized_pct",   0), plus=True))
-        mc3.metric("最大回撤",    _fmt_pct(stats.get("max_drawdown_pct", 0)))
-        mc4.metric("Sharpe",      "{:.3f}".format(stats.get("sharpe", 0) or 0))
-        mc5.metric("胜率（日）",  "{:.1f}%".format(stats.get("win_rate_pct", 0) or 0))
+        # 诊断：若 final_pnl 为 0，给出提示
+        if stats.get("final_pnl", 0) == 0 and not df_daily.empty:
+            st.warning(
+                "⚠️ 盈亏为 0：可能是价格路径的日期范围（{} ~ {}）"
+                "与期权到期日不匹配，或所有日期的 BS 价格变化为零。"
+                "请检查期权到期日与价格路径日期是否存在重叠。".format(
+                    str(df_daily["date"].iloc[0]),
+                    str(df_daily["date"].iloc[-1]),
+                )
+            )
+            with st.expander("调试：逐日盈亏明细（前20行）", expanded=True):
+                dcols = ["date", "spot"]
+                dcols += [c for c in df_daily.columns if c.startswith("pos_")]
+                dcols += ["opt_pnl", "etf_pnl", "total_pnl", "cumulative_pnl",
+                          "net_delta", "etf_shares"]
+                dcols = [c for c in dcols if c in df_daily.columns]
+                st.dataframe(df_daily[dcols].head(20), width='stretch')
 
         if df_daily.empty or df_price is None:
             continue
 
-        # ── 双图：价格路径 + 盈亏曲线 ─────────────────────────────────────────
-        fig = make_subplots(
-            rows=2, cols=1, shared_xaxes=True,
-            row_heights=[0.55, 0.45],
-            vertical_spacing=0.06,
-            subplot_titles=("标的价格路径 + 行权价区间", "逐日累计盈亏"),
+        # ── 交易明细表 ────────────────────────────────────────────────────
+        with st.expander("📋 交易明细（开仓 / Delta对冲 / 到期结算）", expanded=True):
+            if trade_log:
+                df_log = pd.DataFrame(trade_log)
+                df_log["日期"] = df_log["日期"].astype(str)
+                for col in ["金额", "累计盈亏"]:
+                    if col in df_log.columns:
+                        df_log[col] = df_log[col].apply(
+                            lambda x: "{:+,.2f}".format(float(x))
+                            if x is not None else "—"
+                        )
+                display_cols = [c for c in ["日期", "类型", "操作", "方向",
+                                             "数量", "价格", "金额", "累计盈亏", "说明"]
+                                if c in df_log.columns]
+                st.dataframe(df_log[display_cols], width='stretch')
+            else:
+                st.info("暂无交易记录")
+
+        # ── 三图：价格路径 + 累计盈亏 + Delta 走势 ───────────────────────
+        has_delta = "net_delta" in df_daily.columns
+        n_rows    = 3 if has_delta else 2
+        row_h     = [0.45, 0.35, 0.20] if has_delta else [0.55, 0.45]
+        subtitles = (
+            ["标的价格路径 + 行权价区间", "逐日累计盈亏（期权+ETF对冲）", "净Delta走势"]
+            if has_delta else
+            ["标的价格路径 + 行权价区间", "逐日累计盈亏"]
         )
 
-        # 价格路径
+        fig = make_subplots(
+            rows=n_rows, cols=1, shared_xaxes=True,
+            row_heights=row_h,
+            vertical_spacing=0.05,
+            subplot_titles=subtitles,
+        )
+
+        # 图1：价格路径
         fig.add_trace(
             go.Scatter(
                 x=df_price["date"].astype(str),
@@ -272,38 +360,70 @@ def page_backtest():
                 line={"color": "#1f77b4", "width": 2},
             ), row=1, col=1,
         )
-        # 行权价水平线
+
         call_k = summary["call_strike"]
         put_k  = summary["put_strike"]
         ub     = summary["upper_breakeven"]
         lb     = summary["lower_breakeven"]
 
-        for val, color, label in [
+        for val, color, lbl in [
             (call_k, "#ff7f0e", "Call K={:.3f}".format(call_k)),
             (put_k,  "#2ca02c", "Put K={:.3f}".format(put_k)),
-            (ub,     "#ff4444", "上方盈亏平衡 {:.3f}".format(ub)),
-            (lb,     "#ff4444", "下方盈亏平衡 {:.3f}".format(lb)),
+            (ub,     "#ff4444", "上方平衡 {:.3f}".format(ub)),
+            (lb,     "#ff4444", "下方平衡 {:.3f}".format(lb)),
         ]:
             fig.add_hline(y=val, line_dash="dash", line_color=color,
-                          annotation_text=label, row=1, col=1)
+                          annotation_text=lbl, row=1, col=1)
 
-        # 累计盈亏曲线
+        # 图2：累计盈亏（总 + 期权分量 + ETF分量）
         pnl_color = "#00cc44" if df_daily["cumulative_pnl"].iloc[-1] >= 0 else "#ff4444"
         fig.add_trace(
             go.Scatter(
                 x=df_daily["date"].astype(str),
                 y=df_daily["cumulative_pnl"],
-                mode="lines",
-                fill="tozeroy",
-                name="累计盈亏",
+                mode="lines", fill="tozeroy",
+                name="累计总盈亏",
                 line={"color": pnl_color, "width": 2},
                 fillcolor="rgba(0,204,68,0.15)" if pnl_color == "#00cc44"
                            else "rgba(255,68,68,0.15)",
             ), row=2, col=1,
         )
+        if "opt_pnl" in df_daily.columns:
+            fig.add_trace(
+                go.Scatter(
+                    x=df_daily["date"].astype(str),
+                    y=df_daily["opt_pnl"].cumsum(),
+                    mode="lines", name="期权盈亏",
+                    line={"color": "#17becf", "width": 1.5, "dash": "dot"},
+                ), row=2, col=1,
+            )
+        if "etf_pnl" in df_daily.columns:
+            fig.add_trace(
+                go.Scatter(
+                    x=df_daily["date"].astype(str),
+                    y=df_daily["etf_pnl"].cumsum(),
+                    mode="lines", name="ETF对冲盈亏",
+                    line={"color": "#bcbd22", "width": 1.5, "dash": "dot"},
+                ), row=2, col=1,
+            )
+
+        # 图3：净 Delta
+        if has_delta:
+            fig.add_trace(
+                go.Bar(
+                    x=df_daily["date"].astype(str),
+                    y=df_daily["net_delta"],
+                    name="净Delta",
+                    marker_color=[
+                        "#ff7f0e" if v > 0 else "#1f77b4"
+                        for v in df_daily["net_delta"]
+                    ],
+                ), row=3, col=1,
+            )
+            fig.add_hline(y=0, line_color="#888888", row=3, col=1)
 
         fig.update_layout(
-            height=600,
+            height=700 if has_delta else 600,
             paper_bgcolor="#0e1117",
             plot_bgcolor="#1a1d23",
             font={"color": "#fafafa", "size": 12},
@@ -315,6 +435,19 @@ def page_backtest():
         fig.update_yaxes(gridcolor="#2a2d33")
 
         st.plotly_chart(fig, width='stretch')
+
+        # ── 逐日明细表（可折叠） ──────────────────────────────────────────
+        with st.expander("📊 逐日回测明细", expanded=False):
+            daily_show = ["date", "spot"]
+            daily_show += [c for c in df_daily.columns if c.startswith("pos_")]
+            daily_show += ["opt_pnl", "etf_pnl", "total_pnl",
+                           "cumulative_pnl", "net_delta", "etf_shares"]
+            daily_show = [c for c in daily_show if c in df_daily.columns]
+            fmt_dict   = {c: "{:.4f}" for c in daily_show if c != "date"}
+            st.dataframe(
+                df_daily[daily_show].style.format(fmt_dict),
+                width='stretch',
+            )
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -520,17 +653,27 @@ def page_data():
                 st.success("期权链拉取成功，共 {} 条".format(len(df_chain)))
                 st.dataframe(df_chain.head(20), width='stretch')
 
+        days_options = {
+            "30天": 30, "60天": 60, "90天": 90,
+            "180天": 180, "1年": 365, "2年": 730,
+        }
+        days_label = st.selectbox(
+            "拉取日线天数", list(days_options.keys()), index=1,
+            key="pull_days_select",
+        )
+        pull_days = days_options[days_label]
+
         if st.button("拉取日线行情", type="secondary"):
-            with st.spinner("正在拉取日线行情..."):
-                df_spot, err = load_spot_from_akshare(meta["etf"], days=60)
+            with st.spinner("正在拉取 {} 日线行情...".format(days_label)):
+                df_spot, err = load_spot_from_akshare(meta["etf"], days=pull_days)
             if err:
                 st.error("行情拉取失败：{}".format(err))
             else:
                 st.session_state["price_path_df"] = df_spot
                 if not df_spot.empty:
                     st.session_state["spot"] = float(df_spot["close"].iloc[-1])
-                st.success("拉取 {} 条行情，最新价 {:.4f}".format(
-                    len(df_spot), st.session_state["spot"]))
+                st.success("拉取 {} 条行情（{}），最新价 {:.4f}".format(
+                    len(df_spot), days_label, st.session_state["spot"]))
                 # 价格走势小图
                 fig_spot = go.Figure(go.Scatter(
                     x=df_spot["date"].astype(str),
