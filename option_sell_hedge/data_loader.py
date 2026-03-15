@@ -121,52 +121,133 @@ def _check_akshare() -> bool:
         return False
 
 
+def _normalize_ohlc_df(df: pd.DataFrame) -> Optional[pd.DataFrame]:
+    """
+    归一化 OHLCV DataFrame，将各种中文/英文列名统一为 date/open/high/low/close/volume。
+    返回归一化后的 DataFrame，或 None（列不足时）。
+    """
+    col_map = {}
+    for c in df.columns:
+        cl = c.strip()
+        if cl in ("日期", "date", "交易日期", "Date"):
+            col_map[c] = "date"
+        elif cl in ("收盘", "close", "收盘价", "Close"):
+            col_map[c] = "close"
+        elif cl in ("开盘", "open", "开盘价", "Open"):
+            col_map[c] = "open"
+        elif cl in ("最高", "high", "最高价", "High"):
+            col_map[c] = "high"
+        elif cl in ("最低", "low", "最低价", "Low"):
+            col_map[c] = "low"
+        elif cl in ("成交量", "volume", "Volume"):
+            col_map[c] = "volume"
+    df = df.rename(columns=col_map)
+    # 如果没找到 date 列，用第一列
+    if "date" not in df.columns:
+        df = df.rename(columns={df.columns[0]: "date"})
+    # 如果没找到 close 列，用第一个数值列
+    if "close" not in df.columns:
+        num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        if not num_cols:
+            return None
+        df["close"] = df[num_cols[0]]
+    df["date"]  = pd.to_datetime(df["date"], errors="coerce").dt.date
+    df["close"] = pd.to_numeric(df["close"], errors="coerce")
+    df = df.dropna(subset=["date", "close"]).sort_values("date").reset_index(drop=True)
+    return df
+
+
 def load_spot_from_akshare(etf_symbol: str, days: int = 60) -> Tuple[Optional[pd.DataFrame], str]:
     """
     通过 akshare 拉取 ETF 日线行情，返回近 days 天数据。
-    返回 DataFrame[date, open, high, low, close, volume] 或 (None, err)
+    返回 DataFrame[date, close, ...] 或 (None, err)。
+
+    接口优先级：
+      A. fund_etf_hist_em      —— 东方财富，前复权（稳定时首选）
+      B. stock_zh_a_hist       —— 东方财富，A股/ETF 通用
+      C. fund_etf_hist_sina    —— 新浪，备用
+    任一接口遇到网络断开时自动重试 2 次，全部失败则尝试下一接口。
     """
     if not _check_akshare():
         return None, "akshare 未安装，请 pip install akshare"
-    try:
-        import akshare as ak
-        end_date   = datetime.date.today().strftime("%Y%m%d")
-        start_date = (datetime.date.today() - datetime.timedelta(days=days)).strftime("%Y%m%d")
-        df = ak.fund_etf_hist_em(
-            symbol=etf_symbol,
-            period="daily",
-            start_date=start_date,
-            end_date=end_date,
-            adjust="qfq",
-        )
-        if df is None or df.empty:
-            return None, "akshare 返回空数据，symbol={}".format(etf_symbol)
-        # 列名归一化
-        col_map = {}
-        for c in df.columns:
-            cl = c.strip().lower()
-            if cl in ("日期", "date", "交易日期"):
-                col_map[c] = "date"
-            elif cl in ("收盘", "close", "收盘价"):
-                col_map[c] = "close"
-            elif cl in ("开盘", "open", "开盘价"):
-                col_map[c] = "open"
-        df = df.rename(columns=col_map)
-        if "date" not in df.columns:
-            df = df.rename(columns={df.columns[0]: "date"})
-        if "close" not in df.columns:
-            # 尝试找数值列
-            num_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-            if num_cols:
-                df["close"] = df[num_cols[0]]
-            else:
-                return None, "无法识别 close 列"
-        df["date"]  = pd.to_datetime(df["date"], errors="coerce").dt.date
-        df["close"] = pd.to_numeric(df["close"], errors="coerce")
-        df = df.dropna(subset=["date", "close"]).sort_values("date").reset_index(drop=True)
-        return df, ""
-    except Exception as e:
-        return None, "akshare 拉取日线失败：{}".format(e)
+
+    import akshare as ak
+    import time as _time
+
+    end_date   = datetime.date.today().strftime("%Y%m%d")
+    start_date = (datetime.date.today() - datetime.timedelta(days=days)).strftime("%Y%m%d")
+
+    last_err = ""
+
+    # ── 带重试的通用调用包装 ────────────────────────────────────────────────
+    def _try_call(fn, retries=2, **kwargs):
+        """调用 fn(**kwargs)，遇到连接中断最多重试 retries 次，返回 (df, err)"""
+        for attempt in range(retries + 1):
+            try:
+                result = fn(**kwargs)
+                return result, ""
+            except Exception as e:
+                err_str = str(e)
+                # 网络断连 / 超时类错误才重试
+                if any(kw in err_str for kw in (
+                    "RemoteDisconnected", "Connection aborted",
+                    "ConnectionResetError", "timed out", "timeout",
+                    "Read timed out", "Max retries exceeded",
+                )):
+                    if attempt < retries:
+                        _time.sleep(1.5 * (attempt + 1))
+                        continue
+                return None, err_str
+        return None, "重试 {} 次均失败".format(retries)
+
+    # ── 接口 A：fund_etf_hist_em ────────────────────────────────────────────
+    df_raw, err = _try_call(
+        ak.fund_etf_hist_em,
+        symbol=etf_symbol,
+        period="daily",
+        start_date=start_date,
+        end_date=end_date,
+        adjust="qfq",
+    )
+    if df_raw is not None and not df_raw.empty:
+        df = _normalize_ohlc_df(df_raw)
+        if df is not None and not df.empty:
+            return df, ""
+    last_err = "fund_etf_hist_em: {}".format(err or "返回空")
+
+    # ── 接口 B：stock_zh_a_hist（ETF 也支持） ──────────────────────────────
+    df_raw, err = _try_call(
+        ak.stock_zh_a_hist,
+        symbol=etf_symbol,
+        period="daily",
+        start_date=start_date,
+        end_date=end_date,
+        adjust="qfq",
+    )
+    if df_raw is not None and not df_raw.empty:
+        df = _normalize_ohlc_df(df_raw)
+        if df is not None and not df.empty:
+            return df, ""
+    last_err += " | stock_zh_a_hist: {}".format(err or "返回空")
+
+    # ── 接口 C：fund_etf_hist_sina ──────────────────────────────────────────
+    # 新浪接口参数格式不同，symbol 需要带交易所前缀
+    sina_symbol = ("sh" if etf_symbol.startswith(("5", "6", "9")) else "sz") + etf_symbol
+    df_raw, err = _try_call(
+        ak.fund_etf_hist_sina,
+        symbol=sina_symbol,
+    )
+    if df_raw is not None and not df_raw.empty:
+        # 新浪只返回最近数据，截取 days 天
+        df = _normalize_ohlc_df(df_raw)
+        if df is not None and not df.empty:
+            cutoff = datetime.date.today() - datetime.timedelta(days=days)
+            df = df[df["date"] >= cutoff].reset_index(drop=True)
+            if not df.empty:
+                return df, ""
+    last_err += " | fund_etf_hist_sina: {}".format(err or "返回空")
+
+    return None, "akshare 拉取日线失败（三个接口均失败）：{}".format(last_err)
 
 
 def _parse_spot_price_df(df_kv: pd.DataFrame, code: str, call_put: str) -> Optional[dict]:
