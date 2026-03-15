@@ -582,8 +582,12 @@ def page_backtest():
                             "cumulative_pnl", "float_pnl", "opt_mkt_val"]:
                 if amt_col in fmt_dict:
                     fmt_dict[amt_col] = "{:.2f}"
+            # 数值列 NaN 填 0，防止表格显示 None
+            df_show = df_daily[daily_show].copy()
+            num_cols = [c for c in daily_show if c != "date"]
+            df_show[num_cols] = df_show[num_cols].fillna(0.0)
             st.dataframe(
-                df_daily[daily_show].style.format(fmt_dict),
+                df_show.style.format(fmt_dict),
                 width='stretch',
             )
 

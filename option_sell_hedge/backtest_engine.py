@@ -335,7 +335,7 @@ def run_backtest(
                     from data_loader import load_option_daily_close
                     real_px, _err = load_option_daily_close(code, d)
                     if real_px is not None and real_px > 0:
-                        current_px = real_px
+                        current_px = float(real_px)
                 except Exception:
                     pass
 
@@ -343,19 +343,25 @@ def run_backtest(
             if current_px is None:
                 if T_days <= 0:
                     intrinsic  = max(spot - K, 0) if opt_type == "call" else max(K - spot, 0)
-                    current_px = intrinsic
+                    current_px = float(intrinsic)
                 else:
                     res = bs_price_and_greeks(
                         spot, K, T_days, r, sigma,
                         option_type=opt_type, short_pos=False)
-                    current_px = res["price"]
+                    current_px = float(res["price"])
+
+            # 防守：确保 current_px 是有限正数
+            if not math.isfinite(current_px) or current_px < 0:
+                current_px = 0.0
 
             # Greeks（用于 Delta 对冲）
             if T_days > 0:
                 res = bs_price_and_greeks(
                     spot, K, T_days, r, sigma,
                     option_type=opt_type, short_pos=False)
-                pos_delta = res["delta"]
+                pos_delta = float(res["delta"])
+                if not math.isfinite(pos_delta):
+                    pos_delta = 0.0
             else:
                 pos_delta = 0.0
 
@@ -372,10 +378,18 @@ def run_backtest(
             # 单腿今日浮盈亏 = (开仓价 - 今日价) × mult × qty（卖方：价格跌则盈）
             row[col_pos] = round((open_px - current_px) * mult * qty, 2)
 
+        # ── 防守：汇总后再次清理 NaN/Inf ─────────────────────────────────────
+        if not math.isfinite(day_opt_val):
+            day_opt_val = prev_opt_mkt_val   # 沿用前一日市值，避免 NaN 传播
+        if not math.isfinite(net_delta):
+            net_delta = 0.0
+
         # ── 当日期权组合盈亏（增量）────────────────────────────────────────────
         # 卖方视角：前日持仓市值 - 今日持仓市值 = 今日盈利
         opt_daily_pnl    = prev_opt_mkt_val - day_opt_val
         prev_opt_mkt_val = day_opt_val   # 滚动更新
+        if not math.isfinite(opt_daily_pnl):
+            opt_daily_pnl = 0.0
 
         # ── Delta 对冲 ───────────────────────────────────────────────────────
         hedge_action = None
@@ -406,15 +420,23 @@ def run_backtest(
         idx       = dates.index(d)
         prev_spot = closes[dates[idx - 1]] if idx > 0 else spot
         etf_daily_pnl = etf_shares * (spot - prev_spot)
+        if not math.isfinite(etf_daily_pnl):
+            etf_daily_pnl = 0.0
 
-        # 累计盈亏
-        cumulative_opt_pnl += opt_daily_pnl
-        cumulative_etf_pnl += etf_daily_pnl
+        # 累计盈亏（用 isfinite 再次防守，避免 NaN 污染累加器）
+        cumulative_opt_pnl += opt_daily_pnl if math.isfinite(opt_daily_pnl) else 0.0
+        cumulative_etf_pnl += etf_daily_pnl if math.isfinite(etf_daily_pnl) else 0.0
 
         # 浮盈亏（相对开仓价）
         float_pnl      = open_value_total - day_opt_val   # 正=盈利
         float_pnl_pct  = float_pnl / open_value_total * 100 if open_value_total > 0 else 0.0
         float_pnl_cap  = float_pnl / initial_capital * 100 if initial_capital > 0 else 0.0
+        if not math.isfinite(float_pnl):
+            float_pnl = 0.0
+        if not math.isfinite(float_pnl_pct):
+            float_pnl_pct = 0.0
+        if not math.isfinite(float_pnl_cap):
+            float_pnl_cap = 0.0
 
         row["opt_pnl"]            = round(opt_daily_pnl, 2)
         row["etf_pnl"]            = round(etf_daily_pnl, 2)
@@ -540,13 +562,22 @@ def _calc_stats(
     if df.empty or "cumulative_pnl" not in df.columns:
         return {}
 
+    # ── NaN / Inf 清洗 ─────────────────────────────────────────────────────
+    # 用 0 填充 NaN，再把 Inf 替换为 0，防止统计指标崩溃
+    cum_pnl_col = df["cumulative_pnl"].fillna(0.0).replace([np.inf, -np.inf], 0.0)
+    total_pnl_col = (
+        df["total_pnl"].fillna(0.0).replace([np.inf, -np.inf], 0.0)
+        if "total_pnl" in df.columns
+        else cum_pnl_col.diff().fillna(0.0)
+    )
+
     n_days = len(df)
 
     if total_premium <= 0:
         total_premium = 0.01
     base = initial_capital if initial_capital > 0 else total_premium
 
-    final_pnl    = float(df["cumulative_pnl"].iloc[-1])
+    final_pnl    = float(cum_pnl_col.iloc[-1])
     total_return = final_pnl / base
 
     if math.isfinite(total_return) and total_return > -1:
@@ -554,17 +585,25 @@ def _calc_stats(
     else:
         annualized = total_return
 
-    # 最大回撤
-    cum      = df["cumulative_pnl"].values
+    # 确保 annualized 有限
+    if not math.isfinite(annualized):
+        annualized = 0.0
+
+    # 最大回撤（基于清洗后序列）
+    cum      = cum_pnl_col.values
     peak     = np.maximum.accumulate(cum)
     drawdown = (peak - cum) / (np.abs(peak) + 1e-9)
     max_dd   = float(np.max(drawdown))
+    if not math.isfinite(max_dd):
+        max_dd = 0.0
 
-    # Sharpe
-    daily_pnl = df["total_pnl"].values
+    # Sharpe（基于清洗后每日盈亏）
+    daily_pnl = total_pnl_col.values
     if len(daily_pnl) > 1 and np.std(daily_pnl) > 0:
         excess = daily_pnl - r / 252 * base
         sharpe = float(np.mean(excess) / np.std(excess) * math.sqrt(252))
+        if not math.isfinite(sharpe):
+            sharpe = 0.0
     else:
         sharpe = 0.0
 
@@ -578,14 +617,18 @@ def _calc_stats(
     avg_loss = float(np.mean(np.abs(daily_pnl[daily_pnl < 0]))) if loss_days > 0 else 1.0
     pl_ratio = avg_win / avg_loss if avg_loss > 0 else 0.0
 
-    # 最终浮盈亏（以最后一日的 float_pnl 为准）
-    final_float_pnl      = float(df["float_pnl"].iloc[-1])       if "float_pnl"       in df.columns else final_pnl
-    final_float_pct_prem = float(df["float_pnl_pct"].iloc[-1])   if "float_pnl_pct"   in df.columns else 0.0
-    final_float_pct_cap  = float(df["float_pnl_cap_pct"].iloc[-1]) if "float_pnl_cap_pct" in df.columns else 0.0
+    # 最终浮盈亏（以最后一日的 float_pnl 为准，同样做 NaN 保护）
+    def _safe_last(col_name: str, fallback: float = 0.0) -> float:
+        if col_name not in df.columns:
+            return fallback
+        v = df[col_name].fillna(0.0).replace([np.inf, -np.inf], 0.0).iloc[-1]
+        return float(v) if math.isfinite(float(v)) else fallback
 
-    # 期权分量 / ETF分量 最终盈亏
-    final_opt_pnl = float(df["cumulative_opt_pnl"].iloc[-1]) if "cumulative_opt_pnl" in df.columns else final_pnl
-    final_etf_pnl = float(df["cumulative_etf_pnl"].iloc[-1]) if "cumulative_etf_pnl" in df.columns else 0.0
+    final_float_pnl      = _safe_last("float_pnl",       final_pnl)
+    final_float_pct_prem = _safe_last("float_pnl_pct",   0.0)
+    final_float_pct_cap  = _safe_last("float_pnl_cap_pct", 0.0)
+    final_opt_pnl        = _safe_last("cumulative_opt_pnl", final_pnl)
+    final_etf_pnl        = _safe_last("cumulative_etf_pnl", 0.0)
 
     return {
         "total_premium":        round(total_premium, 2),
@@ -596,8 +639,8 @@ def _calc_stats(
         "final_float_pnl":      round(final_float_pnl, 2),
         "final_float_pct_prem": round(final_float_pct_prem, 2),
         "final_float_pct_cap":  round(final_float_pct_cap, 2),
-        "total_return_pct":     round(total_return * 100, 2),
-        "annualized_pct":       round(annualized * 100, 2),
+        "total_return_pct":     round(total_return * 100, 2)  if math.isfinite(total_return)  else 0.0,
+        "annualized_pct":       round(annualized * 100, 2)    if math.isfinite(annualized)     else 0.0,
         "max_drawdown_pct":     round(max_dd * 100, 2),
         "sharpe":               round(sharpe, 3),
         "win_rate_pct":         round(win_rate * 100, 2),
