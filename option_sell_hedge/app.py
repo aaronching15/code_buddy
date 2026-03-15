@@ -30,6 +30,9 @@ from data_loader import (
     get_latest_spot,
     save_positions,
     load_positions,
+    save_fetched_data,
+    load_fetched_data,
+    list_saved_files,
 )
 from strangle_builder import (
     enrich_greeks,
@@ -202,21 +205,52 @@ def page_backtest():
 
         # 回测参数
         with st.expander("回测参数", expanded=False):
-            bt_col1, bt_col2, bt_col3 = st.columns(3)
+            bt_col1, bt_col2, bt_col3, bt_col4 = st.columns(4)
             initial_capital = bt_col1.number_input(
                 "期初本金（元）", value=1_000_000, step=100_000,
                 min_value=10_000, key="bt_capital",
             )
-            delta_hedge = bt_col2.checkbox("启用 Delta 对冲（每日买卖ETF）", value=True,
+            margin_ratio_pct = bt_col2.slider(
+                "保证金占用比例 (%)", 10, 50, 25, 5,
+                key="bt_margin_ratio",
+                help="每手期权保证金 = 标的价 × 合约乘数 × 比例",
+            )
+            delta_hedge = bt_col3.checkbox("启用 Delta 对冲（每日买卖ETF）", value=True,
                                            key="bt_delta_hedge")
-            hedge_threshold = bt_col3.slider(
+            hedge_threshold = bt_col4.slider(
                 "对冲触发阈值（Delta）", 0.01, 0.20, 0.05, 0.01,
                 key="bt_hedge_thresh",
+            )
+
+        # 资金占用预估（实时显示，不需要点按钮）
+        if pairs:
+            from backtest_engine import calc_max_lots, calc_margin_per_lot
+            sample_pair  = pairs[0]
+            sample_mult  = int(sample_pair["call_leg"].get("multiplier", 10000))
+            margin_ratio = margin_ratio_pct / 100.0
+            m_per_lot    = calc_margin_per_lot(spot, sample_mult, margin_ratio)
+            qty_est      = calc_max_lots(
+                float(initial_capital), spot, sample_mult, margin_ratio, n_legs=2)
+            total_margin_est = 2 * m_per_lot * qty_est
+            margin_pct_est   = total_margin_est / float(initial_capital) * 100
+            free_cap_est     = float(initial_capital) - total_margin_est
+
+            st.info(
+                "💡 **资金占用预估**：标的价 {:.3f}，1手保证金 **{:,.0f} 元**（名义本金{:,.0f}×{:.0f}%）；"
+                "本金 {:,.0f} 元 → 每腿最多建仓 **{} 手**（共 {} 手 call + {} 手 put），"
+                "保证金占用 **{:,.0f} 元（{:.1f}%）**，可用资金 **{:,.0f} 元**".format(
+                    spot,
+                    m_per_lot, spot * sample_mult, margin_ratio_pct,
+                    float(initial_capital),
+                    qty_est, qty_est, qty_est,
+                    total_margin_est, margin_pct_est, free_cap_est,
+                )
             )
 
         if st.button("运行回测", type="primary"):
             all_results = []
             debug_msgs  = []
+            margin_ratio = margin_ratio_pct / 100.0
             for pair in pairs:
                 positions = strangle_to_positions(pair)
                 # 调试：打印各腿 open_price
@@ -232,6 +266,7 @@ def page_backtest():
                     delta_hedge=delta_hedge,
                     hedge_threshold=hedge_threshold,
                     initial_capital=float(initial_capital),
+                    margin_ratio=margin_ratio,
                 )
                 summary = summarize_strangle(pair, spot)
                 label = "Call{}/Put{}".format(
@@ -278,13 +313,27 @@ def page_backtest():
         trade_log = res.get("trade_log", [])
 
         # ── 概览：本金 + 权利金 + 最终盈亏 ─────────────────────────────────
-        cap_col1, cap_col2, cap_col3 = st.columns(3)
+        cap_col1, cap_col2, cap_col3, cap_col4 = st.columns(4)
         cap_col1.info("💰 期初本金：**{:,.0f} 元**".format(
             stats.get("initial_capital", 0)))
         cap_col2.info("📥 收取权利金：**{:,.2f} 元**".format(
             stats.get("total_premium", 0)))
         cap_col3.info("📤 最终盈亏：**{:+,.2f} 元**".format(
             stats.get("final_pnl", 0)))
+        cap_col4.info("📊 浮盈亏（期末）：**{:+,.2f} 元** / **{:+.2f}%**（权利金）/ **{:+.2f}%**（本金）".format(
+            stats.get("final_float_pnl", 0),
+            stats.get("final_float_pct_prem", 0),
+            stats.get("final_float_pct_cap", 0),
+        ))
+
+        # ── 资金占用面板 ─────────────────────────────────────────────────────
+        with st.expander("💼 资金占用详情", expanded=False):
+            mc_a, mc_b, mc_c, mc_d, mc_e = st.columns(5)
+            mc_a.metric("每手保证金", "{:,.0f} 元".format(stats.get("margin_per_lot", 0)))
+            mc_b.metric("每腿建仓手数", "{} 手".format(stats.get("qty_per_leg", 1)))
+            mc_c.metric("保证金总占用", "{:,.0f} 元".format(stats.get("total_margin", 0)))
+            mc_d.metric("保证金占本金", "{:.1f}%".format(stats.get("margin_pct", 0)))
+            mc_e.metric("可用余资金", "{:,.0f} 元".format(stats.get("free_capital", 0)))
 
         # 绩效指标卡片
         mc1, mc2, mc3, mc4, mc5 = st.columns(5)
@@ -334,10 +383,11 @@ def page_backtest():
                 st.info("暂无交易记录")
 
         # ── 三图：价格路径 + 累计盈亏 + Delta 走势 ───────────────────────
-        has_delta = "net_delta" in df_daily.columns
-        n_rows    = 3 if has_delta else 2
-        row_h     = [0.45, 0.35, 0.20] if has_delta else [0.55, 0.45]
-        subtitles = (
+        has_delta    = "net_delta"   in df_daily.columns
+        has_float    = "float_pnl"  in df_daily.columns
+        n_rows       = 3 if has_delta else 2
+        row_h        = [0.40, 0.38, 0.22] if has_delta else [0.52, 0.48]
+        subtitles    = (
             ["标的价格路径 + 行权价区间", "逐日累计盈亏（期权+ETF对冲）", "净Delta走势"]
             if has_delta else
             ["标的价格路径 + 行权价区间", "逐日累计盈亏"]
@@ -406,6 +456,15 @@ def page_backtest():
                     line={"color": "#bcbd22", "width": 1.5, "dash": "dot"},
                 ), row=2, col=1,
             )
+        if has_float:
+            fig.add_trace(
+                go.Scatter(
+                    x=df_daily["date"].astype(str),
+                    y=df_daily["float_pnl"],
+                    mode="lines", name="浮盈亏（期权仓位）",
+                    line={"color": "#e377c2", "width": 1.5, "dash": "dash"},
+                ), row=2, col=1,
+            )
 
         # 图3：净 Delta
         if has_delta:
@@ -440,10 +499,16 @@ def page_backtest():
         with st.expander("📊 逐日回测明细", expanded=False):
             daily_show = ["date", "spot"]
             daily_show += [c for c in df_daily.columns if c.startswith("pos_")]
-            daily_show += ["opt_pnl", "etf_pnl", "total_pnl",
-                           "cumulative_pnl", "net_delta", "etf_shares"]
+            daily_show += [c for c in df_daily.columns if c.startswith("mkt_")]
+            daily_show += ["opt_pnl", "etf_pnl", "total_pnl", "cumulative_pnl",
+                           "float_pnl", "float_pnl_pct", "float_pnl_cap_pct",
+                           "net_delta", "etf_shares", "opt_mkt_val"]
             daily_show = [c for c in daily_show if c in df_daily.columns]
             fmt_dict   = {c: "{:.4f}" for c in daily_show if c != "date"}
+            # 浮盈亏百分比列用百分号格式
+            for pct_col in ["float_pnl_pct", "float_pnl_cap_pct"]:
+                if pct_col in fmt_dict:
+                    fmt_dict[pct_col] = "{:.2f}%"
             st.dataframe(
                 df_daily[daily_show].style.format(fmt_dict),
                 width='stretch',
@@ -643,6 +708,10 @@ def page_data():
         st.session_state["underlying"] = underlying
         meta = UNDERLYING_MAP[underlying]
 
+        data_path = st.session_state.get("data_path", r"D:\auto_tc\data_sync")
+        strategy_name = meta["name"]   # 用标的中文名作为策略目录名
+
+        # ── 期权链拉取 ────────────────────────────────────────────────────────
         if st.button("拉取期权链", type="primary"):
             with st.spinner("正在拉取期权链..."):
                 df_chain, err = load_option_chain_from_akshare(meta["opt"], meta["etf"])
@@ -651,8 +720,17 @@ def page_data():
             else:
                 st.session_state["options_df"] = df_chain
                 st.success("期权链拉取成功，共 {} 条".format(len(df_chain)))
+                # ── 自动保存 ──────────────────────────────────────────────────
+                saved_path, save_err = save_fetched_data(
+                    df_chain, data_path, strategy_name, "option_chain"
+                )
+                if save_err:
+                    st.warning("保存失败：{}".format(save_err))
+                else:
+                    st.caption("✅ 已保存至 {}".format(saved_path))
                 st.dataframe(df_chain.head(20), width='stretch')
 
+        # ── 日线行情拉取 ──────────────────────────────────────────────────────
         days_options = {
             "30天": 30, "60天": 60, "90天": 90,
             "180天": 180, "1年": 365, "2年": 730,
@@ -674,6 +752,15 @@ def page_data():
                     st.session_state["spot"] = float(df_spot["close"].iloc[-1])
                 st.success("拉取 {} 条行情（{}），最新价 {:.4f}".format(
                     len(df_spot), days_label, st.session_state["spot"]))
+                # ── 自动保存（含天数参数） ─────────────────────────────────────
+                saved_path, save_err = save_fetched_data(
+                    df_spot, data_path, strategy_name, "spot",
+                    params={"days": pull_days},
+                )
+                if save_err:
+                    st.warning("保存失败：{}".format(save_err))
+                else:
+                    st.caption("✅ 已保存至 {}".format(saved_path))
                 # 价格走势小图
                 fig_spot = go.Figure(go.Scatter(
                     x=df_spot["date"].astype(str),
@@ -690,6 +777,40 @@ def page_data():
                     margin={"t": 40, "b": 20},
                 )
                 st.plotly_chart(fig_spot, width='stretch')
+
+        # ── 历史保存文件列表 ──────────────────────────────────────────────────
+        with st.expander("📂 已保存的历史数据文件（最新10条）", expanded=False):
+            saved_files = list_saved_files(data_path, strategy_name)
+            if saved_files:
+                for f in saved_files[:10]:
+                    fname = os.path.basename(f)
+                    st.text(fname)
+                    # 提供加载按钮
+                    load_key = "load_{}".format(fname)
+                    if st.button("载入 {}".format(fname), key=load_key):
+                        import pandas as _pd
+                        try:
+                            _df = _pd.read_csv(f, encoding="utf-8-sig")
+                            # 判断是 spot 还是 option_chain
+                            if "close" in _df.columns:
+                                if "date" in _df.columns:
+                                    _df["date"] = _pd.to_datetime(
+                                        _df["date"], errors="coerce").dt.date
+                                st.session_state["price_path_df"] = _df
+                                if not _df.empty:
+                                    st.session_state["spot"] = float(_df["close"].iloc[-1])
+                                st.success("已载入行情数据，共 {} 条".format(len(_df)))
+                            elif "strike_price" in _df.columns:
+                                if "exp_date" in _df.columns:
+                                    _df["exp_date"] = _pd.to_datetime(
+                                        _df["exp_date"], errors="coerce").dt.date
+                                st.session_state["options_df"] = _df
+                                st.success("已载入期权链数据，共 {} 条".format(len(_df)))
+                        except Exception as _e:
+                            st.error("载入失败：{}".format(_e))
+            else:
+                st.info("暂无保存的数据文件（数据路径：{}）".format(
+                    os.path.join(data_path, strategy_name)))
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

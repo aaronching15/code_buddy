@@ -382,6 +382,36 @@ def get_latest_spot(etf_symbol: str) -> Tuple[Optional[float], str]:
         return None, str(e)
 
 
+def load_option_daily_close(
+    code: str,
+    date: "datetime.date",
+) -> Tuple[Optional[float], str]:
+    """
+    通过 akshare 拉取指定日期单只期权合约的收盘价。
+    接口：option_sse_spot_price_sina(symbol=code)
+    返回 (close_price, error_msg)
+    收盘价字段为「最新价」，若当天无数据则返回 None。
+    """
+    if not _check_akshare():
+        return None, "akshare 未安装"
+    try:
+        import akshare as ak
+        df_kv = ak.option_sse_spot_price_sina(symbol=code)
+        if df_kv is None or df_kv.empty:
+            return None, "option_sse_spot_price_sina 返回空，code={}".format(code)
+        kv = dict(zip(df_kv["字段"].astype(str).str.strip(),
+                      df_kv["值"].astype(str).str.strip()))
+        price = pd.to_numeric(kv.get("最新价", ""), errors="coerce")
+        if pd.isna(price) or price <= 0:
+            # 尝试「收盘价」字段
+            price = pd.to_numeric(kv.get("收盘价", ""), errors="coerce")
+        if pd.isna(price) or price <= 0:
+            return None, "合约 {} 最新价为 0 或无效".format(code)
+        return float(price), ""
+    except Exception as e:
+        return None, "拉取期权收盘价失败 code={}: {}".format(code, e)
+
+
 # ─── Excel 模板生成 ─────────────────────────────────────────────────────────
 
 def build_template_df() -> pd.DataFrame:
@@ -413,6 +443,96 @@ def build_template_df() -> pd.DataFrame:
         },
     ]
     return pd.DataFrame(rows)
+
+
+# ─── 拉取数据持久化 ─────────────────────────────────────────────────────────
+
+def make_data_filename(
+    strategy_name: str,
+    data_type: str,
+    params: dict = None,
+    ext: str = "csv",
+) -> str:
+    """
+    生成数据文件名，格式：
+        {strategy_name}_{data_type}_{param1}_{param2}_{YYYYMMDD}.{ext}
+    例：
+        50ETF_spot_60d_20250315.csv
+        50ETF_option_chain_20250315.csv
+    """
+    today_str = datetime.date.today().strftime("%Y%m%d")
+    parts = [strategy_name.replace(" ", "_"), data_type]
+    if params:
+        for k, v in params.items():
+            parts.append("{}_{}".format(k, v))
+    parts.append(today_str)
+    return ".".join(["_".join(parts), ext])
+
+
+def save_fetched_data(
+    df: pd.DataFrame,
+    base_dir: str,
+    strategy_name: str,
+    data_type: str,
+    params: dict = None,
+) -> Tuple[str, str]:
+    """
+    将拉取的 DataFrame 按策略名+参数+日期保存到本地目录。
+    目录结构：base_dir / strategy_name / {文件名}.csv
+    返回 (saved_path, error_msg)，成功时 error_msg=""
+    """
+    import os
+    folder = os.path.join(base_dir, strategy_name.replace(" ", "_"))
+    try:
+        os.makedirs(folder, exist_ok=True)
+    except Exception as e:
+        return "", "创建目录失败：{}".format(e)
+
+    fname = make_data_filename(strategy_name, data_type, params)
+    fpath = os.path.join(folder, fname)
+    try:
+        df.to_csv(fpath, index=False, encoding="utf-8-sig")
+        return fpath, ""
+    except Exception as e:
+        return "", "保存文件失败：{}".format(e)
+
+
+def load_fetched_data(
+    base_dir: str,
+    strategy_name: str,
+    data_type: str,
+) -> Tuple[Optional[pd.DataFrame], str]:
+    """
+    加载最新一份保存的数据文件（按文件名日期排序，取最新）。
+    返回 (DataFrame, error_msg)
+    """
+    import os, glob
+    folder = os.path.join(base_dir, strategy_name.replace(" ", "_"))
+    pattern = os.path.join(folder, "*_{}_*.csv".format(data_type))
+    files = sorted(glob.glob(pattern))
+    if not files:
+        return None, "未找到 {} 的历史数据文件（路径：{}）".format(data_type, folder)
+    latest = files[-1]
+    try:
+        df = pd.read_csv(latest, encoding="utf-8-sig")
+        # 尝试解析 date / exp_date 列
+        for col in ("date", "exp_date"):
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], errors="coerce").dt.date
+        return df, ""
+    except Exception as e:
+        return None, "读取文件 {} 失败：{}".format(latest, e)
+
+
+def list_saved_files(
+    base_dir: str,
+    strategy_name: str,
+) -> List[str]:
+    """列出某策略下已保存的全部数据文件（最新在前）"""
+    import os, glob
+    folder = os.path.join(base_dir, strategy_name.replace(" ", "_"))
+    files = sorted(glob.glob(os.path.join(folder, "*.csv")), reverse=True)
+    return files
 
 
 # ─── 持仓快照保存/读取 ──────────────────────────────────────────────────────

@@ -1,0 +1,50 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.so
+
+# 虚拟环境
+.venv/
+venv/
+env/
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# 数据文件（大文件 / 敏感数据不入库）
+*.csv
+*.parquet
+*.feather
+*.h5
+*.hdf5
+*.pkl
+*.pickle
+
+# Excel 原始数据（模板文件保留）
+# 如需保留 templates/ 下的 xlsx，下面这行可注释掉
+# *.xlsx
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# 日志 & 临时文件
+*.log
+*.tmp
+*.bak
+tmp/
+temp/
+
+# 构建产物
+dist/
+build/
+*.egg-info/
